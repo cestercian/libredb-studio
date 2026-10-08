@@ -243,7 +243,13 @@ export const CASSANDRA_OBJECT_KINDS: readonly ObjectKindSpec[] = Object.freeze([
  * that did publish them would otherwise draw two folders of virtual tables.
  *
  * An exact list rather than a prefix, and that is refuted rather than preferred: see
- * point 1 of this file's docblock.
+ * point 1 of this file's docblock. `system_reports` is a keyspace a person can create,
+ * and it is not in this list.
+ *
+ * ScyllaDB adds two that Cassandra 5.0 does not. `system_replicated_keys` is a system
+ * keyspace (scylladb#27954) and `audit` holds `audit.audit_log`
+ * (docs.scylladb.com/manual/stable/operating-scylla/security/auditing). Both were listed
+ * as user keyspaces on ScyllaDB 2026.3.2 (#1428).
  */
 const CASSANDRA_SYSTEM_KEYSPACES: readonly string[] = Object.freeze([
   "system",
@@ -253,7 +259,25 @@ const CASSANDRA_SYSTEM_KEYSPACES: readonly string[] = Object.freeze([
   "system_traces",
   "system_views",
   "system_virtual_schema",
+  "audit",
+  "system_replicated_keys",
 ]);
+
+/**
+ * ScyllaDB's lightweight-transaction shadow table, by suffix.
+ *
+ * Measured on ScyllaDB 2026.3.2: a user table `e2e_t` is listed beside `e2e_t$paxos`,
+ * and opening the shadow composes a statement the parser rejects
+ * (`SELECT * FROM shop.e2e_t$paxos`). ScyllaDB itself hides these from DESCRIBE
+ * (scylladb#28183). The suffix is the whole rule: a table named `paxos`, or one whose
+ * name merely contains `$paxos` without ending in it, is a person's and stays listed.
+ * Other kinds are untouched, because the shadow is a table.
+ */
+const SCYLLA_PAXOS_TABLE_SUFFIX = "$paxos";
+
+function isScyllaPaxosTable(kind: string, name: string): boolean {
+  return kind === "table" && name.endsWith(SCYLLA_PAXOS_TABLE_SUFFIX);
+}
 
 // ============================================================================
 // Statements
@@ -301,7 +325,7 @@ function identifier(value: string): string {
  * The exclusion is applied in TypeScript rather than in the statement, because
  * `keyspace_name` is the partition key and CQL has no `NOT IN` over one: filtering it
  * server-side would need `ALLOW FILTERING` on a catalog read. The catalog is a handful
- * of rows, so reading them all and dropping seven names costs nothing.
+ * of rows, so reading them all and dropping the reserved names costs nothing.
  */
 export const CASSANDRA_KEYSPACE_LIST_CQL = "SELECT keyspace_name FROM system_schema.keyspaces";
 
@@ -792,7 +816,13 @@ export async function countObjects(
     declared.map(async (kind) => {
       const cql = cassandraObjectListCql(keyspace, kind.id);
       if (cql === undefined) return undefined;
-      return (await transport.execute(cql)).rows.length;
+      // The listing drops ScyllaDB's `$paxos` shadow tables. The count is the number of
+      // rows that listing shows, not the number the catalog returned, or the badge and
+      // the folder disagree.
+      const spec = objectCatalog(kind.id)!;
+      return (await transport.execute(cql)).rows.filter(
+        (row) => !isScyllaPaxosTable(kind.id, readText(row[spec.nameColumn])),
+      ).length;
     }),
   );
 
@@ -849,14 +879,17 @@ export async function listObjects(
 
   const result = await transport.execute(cassandraObjectListCql(keyspace, kind)!);
   const objects: DatabaseObject[] = [];
-  // Nothing is SKIPPED here. A row whose name column read as something other than a
-  // string would surface as an object named "", which is visible; dropping it would be
-  // an object that exists in the catalog and cannot be reached from the tree, and an
-  // absence that passes every gate is the worst shape of defect this epic has found.
-  // No measured row can do it either: every one of these name columns is part of its
-  // catalog's primary key, so none of them is ever null.
+  // A row whose name column read as something other than a string would surface as an
+  // object named "", which is visible; dropping it would be an object that exists in
+  // the catalog and cannot be reached from the tree. No measured row can do it: every
+  // one of these name columns is part of its catalog's primary key, so none is null.
+  // The ONE name that is dropped is ScyllaDB's LWT shadow table, whose name ends in
+  // `$paxos`: it is in the catalog and SELECT against it does not parse (#1428). The
+  // count applies the same predicate, so the badge still equals the folder.
   for (const row of result.rows) {
-    objects.push({ path: objectPath(container, spec, row), name: readText(row[spec.nameColumn]), kind });
+    const name = readText(row[spec.nameColumn]);
+    if (isScyllaPaxosTable(kind, name)) continue;
+    objects.push({ path: objectPath(container, spec, row), name, kind });
   }
   return objects.sort((left, right) => comparePaths(left.path, right.path));
 }
@@ -1189,9 +1222,12 @@ async function describeRelationBatch(
     else owned.push(row);
   }
 
-  return targets.rows.map((row) => {
+  return targets.rows.flatMap((row) => {
     const name = readText(row[spec.nameColumn]);
-    return relationDetail(objectPath(container, spec, row), name, byOwner.get(name) ?? [], indexes.rows);
+    // The same `$paxos` skip as the listing, so a bulk read does not describe a table
+    // the folder does not name.
+    if (isScyllaPaxosTable(kind, name)) return [];
+    return [relationDetail(objectPath(container, spec, row), name, byOwner.get(name) ?? [], indexes.rows)];
   });
 }
 

@@ -876,9 +876,18 @@ treatment.
 keyspace a person created — the invisible absence standing behind #789's worst class of defect. The
 provider carries an exact list: Cassandra 5.0's own five system keyspaces plus the two virtual ones,
 `system_views` and `system_virtual_schema`, which have never appeared in `system_schema.keyspaces`
-(measured: seven rows on the fixture node, neither among them) and cost nothing to carry. The fixture
+(measured: seven rows on the fixture node, neither among them) and cost nothing to carry. ScyllaDB
+adds two that Cassandra 5.0 does not, both measured on 2026.3.2 and both listed as user keyspaces
+before they were added: `audit` (the audit log keyspace, `audit.audit_log`) and
+`system_replicated_keys` (a system keyspace; scylladb#27954). The fixture
 creates `system_reports` precisely so the prefix spelling stays refuted rather than merely
 unattractive, and the test asserts that the container listing **shows** it.
+
+A table whose name **ends in `$paxos`** is ScyllaDB's lightweight-transaction shadow
+(scylladb#28183). Measured on 2026.3.2, `e2e_t` was listed beside `e2e_t$paxos`, and opening the
+shadow composed `SELECT * FROM shop.e2e_t$paxos`, which the parser rejects. The listing and the
+count both drop that suffix, and only on the `table` kind: a name that merely contains `$paxos`
+without ending in it stays listed, and so does a user table of any other name.
 
 The exclusion is applied in TypeScript rather than in the statement, because `keyspace_name` is the
 partition key and CQL has no `NOT IN` over one: filtering server-side would need `ALLOW FILTERING` on

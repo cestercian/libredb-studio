@@ -5317,19 +5317,34 @@ describe("object surface", () => {
     await provider.disconnect();
   });
 
-  test("the containers are ordered by code point, and TiDB's upper-case schemas are kept as before", async () => {
-    // TiDB 8.5.8 (`pingcap/tidb:v8.5.8`), measured 2026-10-04: SHOW DATABASES answers its own
-    // schemas in upper case, and SCHEMATA's `SCHEMA_NAME` is `utf8mb4_bin` there, so the
-    // former `NOT IN ('information_schema', ...)` never matched them and the tree showed
-    // INFORMATION_SCHEMA, METRICS_SCHEMA and PERFORMANCE_SCHEMA. The filter here is the same
-    // exact-case comparison, so that tree is unchanged, and so is the order: a binary
-    // collation and a code-point sort put upper case first.
+  test("hides engine-owned databases case-insensitively and keeps a user database of another name", async () => {
+    // TiDB 8.5.8 answers INFORMATION_SCHEMA, PERFORMANCE_SCHEMA and METRICS_SCHEMA in upper
+    // case, so an exact match against the lower-case reserved names left all three in the
+    // tree. OceanBase 4.4.2.1 CE owns `oceanbase`. SingleStore 8.7.12 owns `cluster` and
+    // `memsql`. The comparison folds both sides (#1428). `shop` and `clusters` are user
+    // databases: the second only shares a prefix with a reserved name, and both stay listed.
+    // `Analytics` differs in case from nothing reserved and sorts first by code point.
     mockExecuteFn = async (sql: string) => {
       const normalized = sql.trim().toLowerCase();
       if (normalized.includes("version()")) return [[{ version: "8.0.11-TiDB-v8.5.8" }], []];
       if (normalized === "show databases") {
         return [
-          ["test", "INFORMATION_SCHEMA", "METRICS_SCHEMA", "PERFORMANCE_SCHEMA", "e2e", "mysql", "sys"].map((name) => ({
+          [
+            "shop",
+            "INFORMATION_SCHEMA",
+            "METRICS_SCHEMA",
+            "PERFORMANCE_SCHEMA",
+            "oceanbase",
+            "OceanBase",
+            "cluster",
+            "CLUSTER",
+            "memsql",
+            "clusters",
+            "e2e",
+            "mysql",
+            "SYS",
+            "Analytics",
+          ].map((name) => ({
             Database: name,
           })),
           [],
@@ -5343,13 +5358,7 @@ describe("object surface", () => {
 
     const containers = await provider.listContainers();
 
-    expect(containers.map((c) => c.name)).toEqual([
-      "INFORMATION_SCHEMA",
-      "METRICS_SCHEMA",
-      "PERFORMANCE_SCHEMA",
-      "e2e",
-      "test",
-    ]);
+    expect(containers.map((c) => c.name)).toEqual(["Analytics", "clusters", "e2e", "shop"]);
     expect(containers.filter((c) => c.isSessionDefault).map((c) => c.name)).toEqual(["e2e"]);
     await provider.disconnect();
   });

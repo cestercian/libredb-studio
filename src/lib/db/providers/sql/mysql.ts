@@ -1290,29 +1290,46 @@ const STORAGE_STATS_SQL = `
 // ============================================================================
 
 /**
- * The four schemas MySQL and MariaDB both reserve for themselves.
+ * Schemas the wire-compatible family reserves for the engine.
  *
  * A hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's
  * `pg_depend` ownership test, because neither server publishes the fact: nothing in
- * `information_schema.SCHEMATA` says whether a schema is the server's own. What makes the
- * list safe is that all four names are RESERVED - `CREATE DATABASE mysql` answers
- * ER_DB_CREATE_EXISTS on a fresh server - so hiding them can never hide a database a
- * person created. Measured 2026-09-11 on MySQL 26.7.0 and MariaDB 12.3.2: `SCHEMATA` holds
+ * `information_schema.SCHEMATA` says whether a schema is the server's own. The first four
+ * are RESERVED on MySQL and MariaDB - `CREATE DATABASE mysql` answers ER_DB_CREATE_EXISTS
+ * on a fresh server - so hiding them cannot hide a database a person created under that
+ * spelling. Measured 2026-09-11 on MySQL 26.7.0 and MariaDB 12.3.2: `SCHEMATA` holds
  * exactly these four plus the user's own on both.
+ *
+ * The other four are not stock MySQL. Each was measured as a database the engine owns
+ * and the tree was listing as a person's (#1428): TiDB v8.5.8's `METRICS_SCHEMA`,
+ * OceanBase 4.4.2.1 CE's `oceanbase`, and SingleStore 8.7.12's `cluster` and `memsql`.
  *
  * They are hidden from the BROWSER and remain fully reachable from the SQL editor, which is
  * the same treatment `pg_catalog` gets on PostgreSQL. This provider itself reads two of
  * them (`performance_schema.global_status`, `mysql.innodb_index_stats`).
  */
-const SYSTEM_SCHEMAS = ["information_schema", "mysql", "performance_schema", "sys"] as const;
+const SYSTEM_SCHEMAS = [
+  "information_schema",
+  "mysql",
+  "performance_schema",
+  "sys",
+  // TiDB v8.5.8 publishes this in upper case, beside INFORMATION_SCHEMA.
+  "METRICS_SCHEMA",
+  // OceanBase 4.4.2.1 CE - the engine's own database.
+  "oceanbase",
+  // SingleStore 8.7.12 - the engine's own databases.
+  "cluster",
+  "memsql",
+] as const;
 
 /**
- * Looked up by EXACT name, which is the comparison the former `NOT IN (...)` over
- * `SCHEMATA` made on MySQL (`utf8mb3_bin`) and TiDB (`utf8mb4_bin`), so the tree on both is
- * what it was. TiDB's upper-case `INFORMATION_SCHEMA` was never hidden by that clause and is
- * not hidden by this one.
+ * Looked up case-insensitively. TiDB v8.5.8 answers `SHOW DATABASES` with
+ * `INFORMATION_SCHEMA`, `PERFORMANCE_SCHEMA` and `METRICS_SCHEMA`, and an exact match
+ * against the lower-case reserved names left all three in the tree (#1428). The set
+ * stores each reserved name folded; the filter folds the server's spelling the same way.
+ * A user database whose name is not one of these, in any case, stays listed.
  */
-const SYSTEM_SCHEMA_SET: ReadonlySet<string> = new Set(SYSTEM_SCHEMAS);
+const SYSTEM_SCHEMA_SET: ReadonlySet<string> = new Set(SYSTEM_SCHEMAS.map((name) => name.toLowerCase()));
 
 /**
  * The containers this connection has, which on MySQL is one level: databases.
@@ -3390,7 +3407,7 @@ export class MySQLProvider extends SQLBaseProvider {
       return (
         rows
           .map((row) => String(Object.values(row)[0]))
-          .filter((name) => !SYSTEM_SCHEMA_SET.has(name))
+          .filter((name) => !SYSTEM_SCHEMA_SET.has(name.toLowerCase()))
           .map((name) => ({ path: [name], name, level: 0, isSessionDefault: name === session?.name }))
           // By path, the rule `listObjects` orders by: vtgate answers SHOW DATABASES unsorted.
           .sort((left, right) => comparePaths(left.path, right.path))

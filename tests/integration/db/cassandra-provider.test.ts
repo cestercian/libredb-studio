@@ -2339,6 +2339,43 @@ describe("the object surface, against the committed fixture", () => {
     });
   });
 
+  test("hides ScyllaDB's audit and system_replicated_keys, and skips tables whose name ends in $paxos", async () => {
+    // Measured on ScyllaDB 2026.3.2 (#1428): the keyspaces `audit` and `system_replicated_keys`
+    // are the engine's, and a user table `e2e_t` is listed beside the LWT shadow `e2e_t$paxos`,
+    // which SELECT cannot parse. `system_reports` is a keyspace a person created and stays.
+    // `notes$paxos_extra` contains the suffix without ending in it, so it stays too.
+    const { provider } = await connectedProvider(
+      objectReplies({
+        [CASSANDRA_KEYSPACE_LIST_CQL]: result(declare(["keyspace_name", TEXT]), [
+          { keyspace_name: "audit" },
+          { keyspace_name: "system_replicated_keys" },
+          { keyspace_name: "system_reports" },
+          { keyspace_name: KEYSPACE },
+        ]),
+        [cassandraObjectListCql(KEYSPACE, "table")!]: result(declare(["table_name", TEXT]), [
+          { table_name: "customers" },
+          { table_name: "e2e_t$paxos" },
+          { table_name: "e2e_t" },
+          { table_name: "notes$paxos_extra" },
+        ]),
+      }),
+    );
+
+    const containers = await provider.listContainers!();
+    expect(containers.map((container) => container.name)).toEqual([KEYSPACE, "system_reports"]);
+
+    const tables = await provider.listObjects!([KEYSPACE], "table");
+    expect(tables.map((table) => table.name)).toEqual(["customers", "e2e_t", "notes$paxos_extra"]);
+    expect(await provider.countObjects!([KEYSPACE])).toMatchObject({ table: { count: 3 } });
+
+    const described = await provider.describeObjects!([KEYSPACE], "table");
+    expect(described.details.map((detail) => detail.path)).toEqual([
+      [KEYSPACE, "customers"],
+      [KEYSPACE, "e2e_t"],
+      [KEYSPACE, "notes$paxos_extra"],
+    ]);
+  });
+
   test("lists the user keyspaces and marks the session's own, and does NOT hide system_reports", async () => {
     const { provider } = await connectedProvider(objectReplies());
 
