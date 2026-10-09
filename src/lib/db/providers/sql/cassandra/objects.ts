@@ -410,7 +410,7 @@ interface ObjectCatalogSpec {
    */
   readonly describeTarget?: string;
   /**
-   * The value the reply's own `type` column carries for a row of this kind.
+   * The value, or values, the reply's own `type` column carries for a row of this kind.
    *
    * It exists because `DESCRIBE TABLE` DOES NOT ANSWER ONE ROW. Measured on 5.0.9,
    * `DESCRIBE TABLE probe.customers` answers FOUR: the table, its two indexes and the
@@ -437,7 +437,7 @@ const CASSANDRA_OBJECT_CATALOGS: Readonly<Record<string, ObjectCatalogSpec>> = O
     orderColumn: "view_name",
     describeTarget: "MATERIALIZED VIEW",
     // ScyllaDB answers `view` for a materialized view (and for secondary-index backing views);
-    // Cassandra answers `materialized_view` (measured on 5.0.9 and ScyllaDB 2026.3.2).
+    // Cassandra answers `materialized_view` (measured on 5.0.9, ScyllaDB 2026.2.4 and 2026.3.2).
     describeType: ["materialized_view", "view"],
   },
   index: {
