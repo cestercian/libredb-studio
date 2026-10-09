@@ -1727,7 +1727,7 @@ The gate is the **server**, not the protocol and not the driver.
 | | Measured |
 |---|---|
 | Apache Cassandra 5.0.9 | Answers `DESCRIBE` for all six kinds |
-| ScyllaDB 2026.2.4 (`release_version` 3.0.8) | Answers `DESCRIBE` with the **same four columns**, the same `type` values and the same absence sentence (`Table 'no_such_table' not found in keyspace 'probe'`), verified on `table`, `index` and `type` |
+| ScyllaDB 2026.3.2 (`release_version` 3.0.8) | Answers `DESCRIBE` with the **same four columns** and the same absence sentence (`Table 'no_such_table' not found in keyspace 'probe'`), verified on `table`, `index` and `type`; for materialized views the reply's `type` is **`view`**, not Cassandra's `materialized_view` |
 | `cassandra-driver` 4.9.0 | Negotiates native protocol **v4** against 5.0.9 (`isSupportedCassandra` caps at `0x04`), and `DESCRIBE` works over it. Note that `system.local.native_protocol_version` reports `5`, which is the server's maximum and not the negotiated version |
 
 The driver needs no feature support at all: it sends `DESCRIBE` as an ordinary one-shot query with
