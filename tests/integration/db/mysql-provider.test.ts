@@ -5317,50 +5317,118 @@ describe("object surface", () => {
     await provider.disconnect();
   });
 
-  test("hides engine-owned databases case-insensitively and keeps a user database of another name", async () => {
-    // TiDB 8.5.8 answers INFORMATION_SCHEMA, PERFORMANCE_SCHEMA and METRICS_SCHEMA in upper
-    // case, so an exact match against the lower-case reserved names left all three in the
-    // tree. OceanBase 4.4.2.1 CE owns `oceanbase`. SingleStore 8.7.12 owns `cluster` and
-    // `memsql`. The comparison folds both sides (#1428). `shop` and `clusters` are user
-    // databases: the second only shares a prefix with a reserved name, and both stay listed.
-    // `Analytics` differs in case from nothing reserved and sorts first by code point.
+  // What `SHOW DATABASES` answers on a server where a person also created every name some
+  // OTHER engine in the family owns. Measured 2026-10-09 on mysql:8.4 with
+  // lower_case_table_names=0: `CREATE DATABASE` accepts MYSQL, SYS, cluster, memsql, oceanbase
+  // and METRICS_SCHEMA, and refuses INFORMATION_SCHEMA and Performance_Schema (1044).
+  const ENGINE_OWNED_NAMES = [
+    "shop",
+    "INFORMATION_SCHEMA",
+    "information_schema",
+    "METRICS_SCHEMA",
+    "PERFORMANCE_SCHEMA",
+    "performance_schema",
+    "oceanbase",
+    "cluster",
+    "memsql",
+    "clusters",
+    "e2e",
+    "mysql",
+    "MYSQL",
+    "sys",
+    "SYS",
+    "Analytics",
+  ];
+
+  async function containersOn(version: string, versionComment: string): Promise<string[]> {
     mockExecuteFn = async (sql: string) => {
       const normalized = sql.trim().toLowerCase();
-      if (normalized.includes("version()")) return [[{ version: "8.0.11-TiDB-v8.5.8" }], []];
-      if (normalized === "show databases") {
-        return [
-          [
-            "shop",
-            "INFORMATION_SCHEMA",
-            "METRICS_SCHEMA",
-            "PERFORMANCE_SCHEMA",
-            "oceanbase",
-            "OceanBase",
-            "cluster",
-            "CLUSTER",
-            "memsql",
-            "clusters",
-            "e2e",
-            "mysql",
-            "SYS",
-            "Analytics",
-          ].map((name) => ({
-            Database: name,
-          })),
-          [],
-        ];
-      }
+      if (normalized.includes("@@version_comment")) return [[{ version_comment: versionComment }], []];
+      if (normalized.includes("version()")) return [[{ version }], []];
+      if (normalized === "show databases") return [ENGINE_OWNED_NAMES.map((name) => ({ Database: name })), []];
       if (normalized.startsWith("select database()")) return [[{ name: "e2e" }], []];
       return [[], []];
     };
     const provider = new MySQLProvider(makeMySQLConfig({ database: "e2e" }));
     await provider.connect();
-
     const containers = await provider.listContainers();
-
-    expect(containers.map((c) => c.name)).toEqual(["Analytics", "clusters", "e2e", "shop"]);
-    expect(containers.filter((c) => c.isSessionDefault).map((c) => c.name)).toEqual(["e2e"]);
     await provider.disconnect();
+    return containers.map((c) => c.name);
+  }
+
+  // Ordered by code point, so upper case sorts before lower case and `Analytics` leads.
+  test("on stock MySQL, hides only the reserved schemas and keeps every other engine's names as user databases", async () => {
+    expect(await containersOn("8.4.6", "MySQL Community Server - GPL")).toEqual([
+      "Analytics",
+      "METRICS_SCHEMA",
+      "MYSQL",
+      "SYS",
+      "cluster",
+      "clusters",
+      "e2e",
+      "memsql",
+      "oceanbase",
+      "shop",
+    ]);
+  });
+
+  test("on TiDB, hides the upper-case INFORMATION_SCHEMA, PERFORMANCE_SCHEMA and METRICS_SCHEMA (#1428)", async () => {
+    // Measured on TiDB v8.5.1 and v8.5.8: all three are answered in upper case.
+    expect(
+      await containersOn(
+        "8.0.11-TiDB-v8.5.1",
+        "TiDB Server (Apache License 2.0) Community Edition, MySQL 8.0 compatible",
+      ),
+    ).toEqual(["Analytics", "MYSQL", "SYS", "cluster", "clusters", "e2e", "memsql", "oceanbase", "shop"]);
+  });
+
+  test("on OceanBase, hides its own oceanbase database (#1428)", async () => {
+    expect(await containersOn("5.7.25-OceanBase_CE-v4.4.2.1", "OceanBase_CE 4.4.2.1")).toEqual([
+      "Analytics",
+      "METRICS_SCHEMA",
+      "MYSQL",
+      "SYS",
+      "cluster",
+      "clusters",
+      "e2e",
+      "memsql",
+      "shop",
+    ]);
+  });
+
+  for (const [label, reply] of [
+    ["refused", "refuse"],
+    ["NULL", null],
+  ] as const) {
+    test(`a ${label} @@version_comment leaves the engine unmeasured, so cluster and memsql stay listed`, async () => {
+      mockExecuteFn = async (sql: string) => {
+        const normalized = sql.trim().toLowerCase();
+        if (normalized.includes("@@version_comment")) {
+          if (reply === "refuse") throw Object.assign(new Error("Unknown system variable"), { errno: 1193 });
+          return [[{ version_comment: reply }], []];
+        }
+        if (normalized.includes("version()")) return [[{ version: "5.7.32" }], []];
+        if (normalized === "show databases")
+          return [["cluster", "memsql", "e2e"].map((name) => ({ Database: name })), []];
+        if (normalized.startsWith("select database()")) return [[{ name: "e2e" }], []];
+        return [[], []];
+      };
+      const provider = new MySQLProvider(makeMySQLConfig({ database: "e2e" }));
+      await provider.connect();
+      expect((await provider.listContainers()).map((c) => c.name)).toEqual(["cluster", "e2e", "memsql"]);
+      await provider.disconnect();
+    });
+  }
+
+  test("on SingleStore, recognised by @@version_comment, hides cluster and memsql (#1428)", async () => {
+    // Measured on singlestoredb-dev 0.2.82 (SingleStore 9.1.1): VERSION() is a plain 5.7.32,
+    // so the comment is the only thing naming the engine.
+    expect(
+      await containersOn(
+        "5.7.32",
+        "SingleStoreDB source distribution (compatible; MySQL Enterprise & MySQL Commercial)",
+      ),
+    ).toEqual(["Analytics", "METRICS_SCHEMA", "MYSQL", "SYS", "clusters", "e2e", "oceanbase", "shop"]);
   });
 
   test("nothing nests under a database", async () => {

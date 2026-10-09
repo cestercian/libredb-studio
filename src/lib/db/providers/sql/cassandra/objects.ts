@@ -245,11 +245,6 @@ export const CASSANDRA_OBJECT_KINDS: readonly ObjectKindSpec[] = Object.freeze([
  * An exact list rather than a prefix, and that is refuted rather than preferred: see
  * point 1 of this file's docblock. `system_reports` is a keyspace a person can create,
  * and it is not in this list.
- *
- * ScyllaDB adds two that Cassandra 5.0 does not. `system_replicated_keys` is a system
- * keyspace (scylladb#27954) and `audit` holds `audit.audit_log`
- * (docs.scylladb.com/manual/stable/operating-scylla/security/auditing). Both were listed
- * as user keyspaces on ScyllaDB 2026.3.2 (#1428).
  */
 const CASSANDRA_SYSTEM_KEYSPACES: readonly string[] = Object.freeze([
   "system",
@@ -259,9 +254,50 @@ const CASSANDRA_SYSTEM_KEYSPACES: readonly string[] = Object.freeze([
   "system_traces",
   "system_views",
   "system_virtual_schema",
+]);
+
+/**
+ * The keyspaces ScyllaDB owns beyond Cassandra's, hidden only on a server that answered
+ * `SCYLLA_IDENTITY_CQL`.
+ *
+ * `system_replicated_keys` is a system keyspace (scylladb#27954), `audit` holds
+ * `audit.audit_log` (docs.scylladb.com/manual/stable/operating-scylla/security/auditing),
+ * and `system_distributed_everywhere` is ScyllaDB's too. All three were listed as user
+ * keyspaces on ScyllaDB 2026.2.4 and 2026.3.2 (#1428). They are NOT added to the list above,
+ * because on Cassandra they are a person's: measured 2026-10-09 on cassandra:5.0.9,
+ * `CREATE KEYSPACE` accepts all three names.
+ */
+const SCYLLA_SYSTEM_KEYSPACES: readonly string[] = Object.freeze([
   "audit",
   "system_replicated_keys",
+  "system_distributed_everywhere",
 ]);
+
+/**
+ * The read that tells ScyllaDB from Cassandra. `system.versions` is ScyllaDB's own table:
+ * measured 2026-10-09, scylladb/scylla:2026.2.4 answers one row and cassandra:5.0.9 answers
+ * 8704 "table versions does not exist". `release_version` cannot do it, because ScyllaDB
+ * answers a Cassandra-compatible `3.0.8` there.
+ */
+export const SCYLLA_IDENTITY_CQL = "SELECT key FROM system.versions";
+
+/**
+ * The keyspaces this server owns beyond `CASSANDRA_SYSTEM_KEYSPACES`. Run once per
+ * `connect()`.
+ *
+ * A refusal of any kind answers none: on Cassandra it is the expected answer, and on a
+ * ScyllaDB role that may not read `system.versions` the cost is three keyspaces drawn as a
+ * person's, which is the state before #1428 rather than a keyspace hidden on a guess.
+ */
+export async function readEngineKeyspaces(transport: CassandraTransport): Promise<readonly string[]> {
+  try {
+    await transport.execute(SCYLLA_IDENTITY_CQL);
+    return SCYLLA_SYSTEM_KEYSPACES;
+  } catch (error) {
+    if (error instanceof CassandraTransportError) return [];
+    throw error;
+  }
+}
 
 /**
  * ScyllaDB's lightweight-transaction shadow table, by suffix.
@@ -752,6 +788,7 @@ function toIndexSchema(row: CassandraRow): IndexSchema {
 export async function listContainers(
   transport: CassandraTransport,
   sessionKeyspace: string,
+  engineKeyspaces: readonly string[],
   parent?: readonly string[],
 ): Promise<Container[]> {
   if (parent !== undefined && parent.length > 0) return [];
@@ -760,7 +797,7 @@ export async function listContainers(
   const containers: Container[] = [];
   for (const row of result.rows) {
     const name = readText(row.keyspace_name);
-    if (CASSANDRA_SYSTEM_KEYSPACES.includes(name)) continue;
+    if (CASSANDRA_SYSTEM_KEYSPACES.includes(name) || engineKeyspaces.includes(name)) continue;
     containers.push({ path: [name], name, level: 0, isSessionDefault: name === sessionKeyspace });
   }
   return containers.sort((left, right) => comparePaths(left.path, right.path));

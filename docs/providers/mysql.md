@@ -1206,18 +1206,27 @@ That is what ends the single-database confinement. MySQL resolves a qualified na
 on one connection, unlike PostgreSQL where a `pg` pool is pinned to one database, so every
 database the server holds is genuinely browsable from one session.
 
-Eight schemas are hidden: `information_schema`, `mysql`, `performance_schema`, `sys`, TiDB's
-`METRICS_SCHEMA`, OceanBase's `oceanbase`, and SingleStore's `cluster` and `memsql`. It is a
-hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's `pg_depend` ownership
-test, because neither server publishes the fact: nothing in `SCHEMATA` says whether a schema is the
-server's own. The first four are RESERVED on MySQL and MariaDB, so hiding them cannot hide a database
-a person created under that spelling; measured 2026-09-11, `SCHEMATA` holds exactly those four plus the
-user's own on both servers. The other four are not stock MySQL. Each was measured as a database the
-engine owns and the tree was listing as a person's: TiDB v8.5.8's `METRICS_SCHEMA`, OceanBase 4.4.2.1
-CE's `oceanbase`, and SingleStore 8.7.12's `cluster` and `memsql`. They are hidden from the BROWSER and
-stay fully reachable from the SQL editor, the same treatment `pg_catalog` gets on PostgreSQL, and this
-provider itself reads two of the original four. A user database whose name is none of these stays
-listed, including one that only shares a prefix (`clusters`).
+Four schemas are hidden on every server: `information_schema`, `mysql`, `performance_schema`, `sys`.
+It is a hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's `pg_depend`
+ownership test, because neither server publishes the fact: nothing in `SCHEMATA` says whether a schema
+is the server's own. What makes the list safe is that all four names are RESERVED, so hiding them can
+never hide a database a person created; measured 2026-09-11, `SCHEMATA` holds exactly these four plus
+the user's own on both servers. They are hidden from the BROWSER and stay fully reachable from the SQL
+editor, the same treatment `pg_catalog` gets on PostgreSQL, and this provider itself reads two of them.
+
+Some wire-compatible engines own more, and those names are hidden **only on the engine that owns
+them**, keyed on what the server says it is at connect time (#1428):
+
+| Engine | Hidden as well | Recognised by |
+|---|---|---|
+| TiDB v8.5.1, v8.5.8 | `METRICS_SCHEMA` | `VERSION()` contains `TiDB` |
+| OceanBase 4.4.2.1 CE | `oceanbase` | `VERSION()` contains `OceanBase` |
+| SingleStore 8.7.12, 9.1.1 | `cluster`, `memsql` | `@@version_comment` starts with `SingleStoreDB`; `VERSION()` is a plain `5.7.32` |
+
+They are not hidden everywhere because none of them is reserved on MySQL: measured 2026-10-09 on
+MySQL 8.4, `CREATE DATABASE` accepts `METRICS_SCHEMA`, `oceanbase`, `cluster` and `memsql`, and a
+MySQL user's database of that name stays listed. A server whose `@@version_comment` is refused or NULL
+is treated as unmeasured and gets the reserved four only.
 
 **`SHOW DATABASES` and not `information_schema.SCHEMATA`, because of Vitess.** Through vtgate the two
 disagree, and only `SHOW DATABASES` names something a statement can address. Measured 2026-10-04 on
@@ -1266,13 +1275,15 @@ exactly as it did before. Any other failure is raised as it is.
 
 Three consequences of reading a `SHOW` statement. The reserved names are dropped by the provider after
 the read rather than by a `WHERE`, because vtgate ignores a `WHERE` on `SHOW DATABASES` and answers all
-five rows anyway. The comparison is case-insensitive. TiDB v8.5.8 answers `INFORMATION_SCHEMA`,
-`PERFORMANCE_SCHEMA` and `METRICS_SCHEMA` in upper case, and an exact match against the lower-case
-reserved names left all three in the tree; folding both sides hides them, and it also hides `SYS` and
-`Mysql`, which an exact match had started listing on MariaDB (`lower_case_table_names=0`). A user
-database of another name stays listed. The order is the provider's code-point order over the path, the
-rule `listObjects` already uses, because vtgate answers unsorted; on MariaDB that differs from a
-case-insensitive SQL order for database names that differ in case.
+five rows anyway. `information_schema` and `performance_schema` are compared without regard to case,
+because TiDB answers them as `INFORMATION_SCHEMA` and `PERFORMANCE_SCHEMA`, and no spelling of either
+can be a person's: measured 2026-10-09 on MySQL 8.4 with `lower_case_table_names=0`, `CREATE DATABASE
+INFORMATION_SCHEMA` and `CREATE DATABASE Performance_Schema` both answer 1044. `mysql` and `sys` are
+compared by exact name, because the same server accepts `CREATE DATABASE MYSQL` and `CREATE DATABASE
+SYS`, and those stay listed. The engine-owned names above are exact too, in the spelling each engine
+answers. And the order is the provider's code-point order over the path, the rule `listObjects`
+already uses, because vtgate answers unsorted; on MariaDB that differs from the former SQL order only
+for database names that differ in case.
 
 `Container.isSessionDefault` comes from `SELECT DATABASE()`, the server's own answer for which
 database the session is in, rather than from `config.database`, because the configured value is what a

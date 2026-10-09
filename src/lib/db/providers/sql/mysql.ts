@@ -1290,46 +1290,76 @@ const STORAGE_STATS_SQL = `
 // ============================================================================
 
 /**
- * Schemas the wire-compatible family reserves for the engine.
+ * Schemas the server reserves for itself.
  *
  * A hand-written name list, unlike Oracle's `ORACLE_MAINTAINED` and PostgreSQL's
  * `pg_depend` ownership test, because neither server publishes the fact: nothing in
- * `information_schema.SCHEMATA` says whether a schema is the server's own. The first four
- * are RESERVED on MySQL and MariaDB - `CREATE DATABASE mysql` answers ER_DB_CREATE_EXISTS
- * on a fresh server - so hiding them cannot hide a database a person created under that
+ * `information_schema.SCHEMATA` says whether a schema is the server's own. All four are
+ * RESERVED on MySQL and MariaDB - `CREATE DATABASE mysql` answers ER_DB_CREATE_EXISTS on a
+ * fresh server - so hiding them cannot hide a database a person created under that
  * spelling. Measured 2026-09-11 on MySQL 26.7.0 and MariaDB 12.3.2: `SCHEMATA` holds
  * exactly these four plus the user's own on both.
- *
- * The other four are not stock MySQL. Each was measured as a database the engine owns
- * and the tree was listing as a person's (#1428): TiDB v8.5.8's `METRICS_SCHEMA`,
- * OceanBase 4.4.2.1 CE's `oceanbase`, and SingleStore 8.7.12's `cluster` and `memsql`.
  *
  * They are hidden from the BROWSER and remain fully reachable from the SQL editor, which is
  * the same treatment `pg_catalog` gets on PostgreSQL. This provider itself reads two of
  * them (`performance_schema.global_status`, `mysql.innodb_index_stats`).
  */
-const SYSTEM_SCHEMAS = [
-  "information_schema",
-  "mysql",
-  "performance_schema",
-  "sys",
-  // TiDB v8.5.8 publishes this in upper case, beside INFORMATION_SCHEMA.
-  "METRICS_SCHEMA",
-  // OceanBase 4.4.2.1 CE - the engine's own database.
-  "oceanbase",
-  // SingleStore 8.7.12 - the engine's own databases.
-  "cluster",
-  "memsql",
-] as const;
+const SYSTEM_SCHEMAS = ["information_schema", "mysql", "performance_schema", "sys"] as const;
 
 /**
- * Looked up case-insensitively. TiDB v8.5.8 answers `SHOW DATABASES` with
- * `INFORMATION_SCHEMA`, `PERFORMANCE_SCHEMA` and `METRICS_SCHEMA`, and an exact match
- * against the lower-case reserved names left all three in the tree (#1428). The set
- * stores each reserved name folded; the filter folds the server's spelling the same way.
- * A user database whose name is not one of these, in any case, stays listed.
+ * The reserved schemas that are reserved in EVERY spelling, compared case-insensitively.
+ *
+ * Only these two: measured 2026-10-09 on MySQL 8.4 with `lower_case_table_names=0`,
+ * `CREATE DATABASE INFORMATION_SCHEMA` and `CREATE DATABASE Performance_Schema` answer 1044,
+ * while `CREATE DATABASE MYSQL` and `CREATE DATABASE SYS` succeed. Folding `mysql` and `sys`
+ * too would hide those two user databases. TiDB v8.5.8 answers `SHOW DATABASES` with
+ * `INFORMATION_SCHEMA` and `PERFORMANCE_SCHEMA` in upper case, which is what this fold is
+ * for (#1428).
  */
-const SYSTEM_SCHEMA_SET: ReadonlySet<string> = new Set(SYSTEM_SCHEMAS.map((name) => name.toLowerCase()));
+const CASE_FOLDED_SYSTEM_SCHEMAS: ReadonlySet<string> = new Set(["information_schema", "performance_schema"]);
+
+/**
+ * Databases a wire-compatible engine owns beyond the four above, keyed on what the server
+ * says it is, and compared by exact name.
+ *
+ * Keyed on the server rather than hidden everywhere, because none of these names is
+ * reserved on MySQL: measured 2026-10-09 on MySQL 8.4, `CREATE DATABASE` accepts
+ * `METRICS_SCHEMA`, `oceanbase`, `cluster` and `memsql`, and the tree must keep listing
+ * them there. Each was measured as listed as a person's database on its own engine (#1428).
+ *
+ * - TiDB v8.5.1 and v8.5.8: `METRICS_SCHEMA`, answered in upper case. `VERSION()` carries
+ *   `TiDB`.
+ * - OceanBase 4.4.2.1 CE: `oceanbase`. `VERSION()` carries `OceanBase`.
+ * - SingleStore 8.7.12 and 9.1.1: `cluster` and `memsql`. `VERSION()` is a plain `5.7.32`,
+ *   so `@@version_comment` (`SingleStoreDB source distribution ...`) is what names it.
+ */
+const ENGINE_OWNED_SCHEMAS: readonly {
+  readonly owns: (version: string | undefined, versionComment: string | undefined) => boolean;
+  readonly names: readonly string[];
+}[] = [
+  { owns: (version) => version !== undefined && /tidb/i.test(version), names: ["METRICS_SCHEMA"] },
+  { owns: (version) => version !== undefined && /oceanbase/i.test(version), names: ["oceanbase"] },
+  {
+    owns: (_version, versionComment) => versionComment !== undefined && /^SingleStoreDB\b/i.test(versionComment),
+    names: ["cluster", "memsql"],
+  },
+];
+
+/**
+ * The exact names hidden on a server that answered this `VERSION()` and `@@version_comment`.
+ * An unmeasured server gets the four reserved names only, so nothing a person could have
+ * created is hidden on a guess.
+ */
+function systemSchemasFor(version: string | undefined, versionComment: string | undefined): ReadonlySet<string> {
+  return new Set([
+    ...SYSTEM_SCHEMAS,
+    ...ENGINE_OWNED_SCHEMAS.filter((engine) => engine.owns(version, versionComment)).flatMap((engine) => engine.names),
+  ]);
+}
+
+function isSystemSchema(name: string, systemSchemas: ReadonlySet<string>): boolean {
+  return systemSchemas.has(name) || CASE_FOLDED_SYSTEM_SCHEMAS.has(name.toLowerCase());
+}
 
 /**
  * The containers this connection has, which on MySQL is one level: databases.
@@ -2004,6 +2034,23 @@ const probeServerVersion = async (queryable: MySQLQueryable): Promise<string | u
     return version === null || version === undefined ? undefined : String(version);
   } catch {
     // Refused, so the flavour is unmeasured. The capability this produces IS the report.
+    return undefined;
+  }
+};
+
+/**
+ * What this server says about its own build in `@@version_comment`, or `undefined` when it
+ * would not say. The same never-rejects contract as `probeServerVersion`, for the same reason:
+ * the answer only decides which databases the tree hides, and an unmeasured comment hides
+ * nothing beyond the reserved four.
+ */
+const probeVersionComment = async (queryable: MySQLQueryable): Promise<string | undefined> => {
+  try {
+    const [rows] = await runStatement(queryable, "SELECT @@version_comment AS version_comment");
+    const comment = rows[0]?.version_comment;
+    return comment === null || comment === undefined ? undefined : String(comment);
+  } catch {
+    // Refused, so the engine is unmeasured and only the reserved names are hidden.
     return undefined;
   }
 };
@@ -2829,6 +2876,7 @@ export class MySQLProvider extends SQLBaseProvider {
    * `measuredExplainFormat` stores a grammar and not the text of the probe that found it.
    */
   private measuredFlavour: MySQLFlavour = "mysql";
+  private systemSchemas: ReadonlySet<string> = systemSchemasFor(undefined, undefined);
 
   /**
    * Which maintenance verbs this server's grammar has, measured by `probeMaintenance()` at connect
@@ -2974,7 +3022,10 @@ export class MySQLProvider extends SQLBaseProvider {
       // Which server this is, which is what decides the object-kind declaration (#789).
       // Measured rather than derived from the type id, because there is no `mariadb` type
       // id to derive from.
-      this.measuredFlavour = flavourFor(await probeServerVersion(conn));
+      const version = await probeServerVersion(conn);
+      this.measuredFlavour = flavourFor(version);
+      // Which databases this engine owns beyond the reserved four (#1428). Never rejects.
+      this.systemSchemas = systemSchemasFor(version, await probeVersionComment(conn));
       // Which of ANALYZE, OPTIMIZE and CHECK TABLE this server has (#1387). Never rejects.
       this.measuredMaintenance = await probeMaintenance(conn, this.config.database);
       // Every later acquisition, this probe connection's included, then reads utf8mb3
@@ -3407,7 +3458,7 @@ export class MySQLProvider extends SQLBaseProvider {
       return (
         rows
           .map((row) => String(Object.values(row)[0]))
-          .filter((name) => !SYSTEM_SCHEMA_SET.has(name.toLowerCase()))
+          .filter((name) => !isSystemSchema(name, this.systemSchemas))
           .map((name) => ({ path: [name], name, level: 0, isSessionDefault: name === session?.name }))
           // By path, the rule `listObjects` orders by: vtgate answers SHOW DATABASES unsorted.
           .sort((left, right) => comparePaths(left.path, right.path))
