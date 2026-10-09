@@ -570,6 +570,20 @@ function schemaExclusion(column: string): string {
   return `${column} NOT IN (${SYSTEM_SCHEMA_LIST}) AND ${column} NOT IN (${EXTENSION_OWNED_SCHEMAS_SQL})`;
 }
 
+// The same ownership test one level down, for a routine or a relation an extension put
+// into a user's own schema, where no schema filter reaches it (#1429). Measured on
+// PostgreSQL 18.6 after `CREATE EXTENSION pgcrypto; CREATE EXTENSION hstore;`: `public`
+// held 99 functions for 2 user functions, and the 97 others are exactly the ones with a
+// `pg_depend` row of `deptype = 'e'`. A user's own object never has one, so it always
+// survives. Free of parentheses inside, like the schema test, so the same fallback strips it.
+function extensionMemberExclusion(oidColumn: string, catalog: "pg_class" | "pg_proc"): string {
+  return (
+    `${oidColumn} NOT IN (SELECT d.objid FROM pg_depend d ` +
+    `JOIN pg_extension e ON e.oid = d.refobjid ` +
+    `WHERE d.classid = '${catalog}'::regclass AND d.deptype = 'e')`
+  );
+}
+
 // `kcu.column_name` is `information_schema.sql_identifier`, and node-postgres has no array
 // parser for `sql_identifier[]`: uncast, the list reached `objectDetailFromRow` as the text
 // `{id}`, where `includes()` became a substring test that flagged `i` and `d` as keys too,
@@ -733,9 +747,13 @@ function isMissingConstraintColumnUsageError(error: unknown): boolean {
 // YugabyteDB, Cloudberry, AlloyDB Omni, CockroachDB and Materialize among them, but
 // the driver serves engines nobody here has run. One that has no pg_depend or
 // pg_extension drops the clause and keeps the fixed list, which is what it filtered
-// on before ownership was asked at all.
+// on before ownership was asked at all. Both forms go: the schema test and the
+// per-object test `extensionMemberExclusion()` writes.
 function withoutExtensionOwnershipTest(sql: string): string {
-  return sql.replace(/\s+AND\s+[\w.]+ NOT IN \(SELECT n\.nspname FROM pg_namespace n JOIN pg_depend[^)]*\)/g, "");
+  return sql.replace(
+    /\s+AND\s+[\w.]+ NOT IN \(SELECT (?:n\.nspname FROM pg_namespace n|d\.objid FROM pg_depend d) JOIN pg_[^)]*\)/g,
+    "",
+  );
 }
 
 // tables_info lists relations from information_schema and then resolves each name to a
@@ -836,7 +854,8 @@ const COUNTS_RELATION_ARM = `
                  END AS kind
           FROM pg_catalog.pg_class c
           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','S')`;
+          WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','S')
+          AND ${extensionMemberExclusion("c.oid", "pg_class")}`;
 
 // `prokind` is a PostgreSQL 11 column. Everything that predates it, and the forks that
 // never grew it, refuse this arm - which is why it is separable at all. They do not agree
@@ -847,7 +866,8 @@ const COUNTS_ROUTINE_ARM = `
           SELECT CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure' END
           FROM pg_catalog.pg_proc p
           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-          WHERE n.nspname = $1`;
+          WHERE n.nspname = $1
+          AND ${extensionMemberExclusion("p.oid", "pg_proc")}`;
 
 // `tgisinternal` excludes the triggers PostgreSQL creates for a foreign key or a
 // deferred unique constraint. A user never wrote them and cannot drop them on their own,
@@ -920,7 +940,8 @@ function hasColumns(kind: string): boolean {
 // every relation on CockroachDB and Materialize as 0 bytes. The size column is simply
 // dropped instead (`withSize: false`), so the row carries no `size_bytes` at all and
 // `measuredSizeBytes()` reads absence. Nothing else in this statement is repairable by
-// that chain: it has no `AS MATERIALIZED`, no `to_regclass` and no `pg_depend`.
+// that chain: it has no `AS MATERIALIZED` and no `to_regclass`, and its one `pg_depend`
+// clause, the extension ownership test, has its own repair in `queryListing()`.
 function listRelationsSql(relkinds: string): string {
   return `
         SELECT
@@ -929,7 +950,8 @@ function listRelationsSql(relkinds: string): string {
           pg_total_relation_size(c.oid) AS size_bytes
         FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $1 AND c.relkind IN (${relkinds})`;
+        WHERE n.nspname = $1 AND c.relkind IN (${relkinds})
+        AND ${extensionMemberExclusion("c.oid", "pg_class")}`;
 }
 
 const LIST_RELATIONS_SQL: Record<string, string> = Object.fromEntries(
@@ -979,7 +1001,8 @@ const LIST_ROUTINES_SQL = `
           ${ROUTINE_IDENTITY_EXPR} AS identity
         FROM pg_catalog.pg_proc p
         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = $1 AND p.prokind = $2`;
+        WHERE n.nspname = $1 AND p.prokind = $2
+        AND ${extensionMemberExclusion("p.oid", "pg_proc")}`;
 
 // A trigger name is unique per TABLE, not per schema - two tables in one schema may each
 // carry a trigger called `stamp_updated_at` - so the table is a path segment and not
@@ -1618,6 +1641,7 @@ function bulkDetailSql(relkinds: string, bound?: number): string {
           FROM pg_catalog.pg_class c
           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = $1 AND c.relkind IN (${relkinds})
+          AND ${extensionMemberExclusion("c.oid", "pg_class")}
           ORDER BY c.relname${limit}
         ),
         described_columns AS (
@@ -2065,21 +2089,45 @@ const ACTIVE_SESSIONS_SQL = `
         LIMIT $2
       `;
 
-// getTableStats: per-table stats. A schema WHERE clause is interpolated
-// between the two fragments at the call site.
-const TABLE_STATS_SELECT_SQL = `
+// The three size builtins the table statistics read, each taking `relid` - the table's own
+// oid, which pg_stat_user_tables already carries.
+//
+// They used to take `quote_ident(schemaname) || '.' || quote_ident(relname)`. Stock
+// PostgreSQL casts that text to `regclass` implicitly; CockroachDB v26.3.2 answers
+// `unknown signature: pg_table_size(string)` and RisingWave 3.1.0 fails to bind it, so the
+// whole read died on both and took Monitoring > Tables, Storage and the Admin > Operations
+// table list - and every per-table maintenance action with it (#1436). An oid needs no cast
+// and no name re-parsing, so an identifier holding a dot or a quote cannot be mis-resolved
+// either. Measured 2026-10-04: on PostgreSQL 18.6 both forms answer the same bytes.
+//
+// Each is INDEPENDENTLY absent on some relative, which is why they are a list rather than one
+// clause: measured on RisingWave 3.1.0, pg_table_size(relid) and pg_indexes_size(relid)
+// answer (44 and 0 on a seeded table) while pg_total_relation_size does not bind at all.
+const TABLE_SIZE_FNS = ["pg_table_size", "pg_indexes_size", "pg_total_relation_size"] as const;
+
+// getTableStats: per-table stats, with the caller's schema WHERE clause.
+//
+// No `pg_size_pretty()`: RisingWave does not bind that one either, and `formatBytes()`
+// already spells every other size this provider reports - the database size here, and the
+// object surface's relation sizes. Asking the server to format what this process formats
+// everywhere else was one more builtin to depend on and a second spelling of a byte count.
+//
+// The ORDER BY names the OUTPUT ALIAS rather than repeating the size expression, so dropping
+// a refused builtin below repairs the sort with it instead of leaving a call behind in a
+// clause the SELECT no longer has. `NULLS LAST` keeps an unmeasured table from heading the
+// list, and the schema and table names are the tie-breaker that makes the order total:
+// without one, every row of an engine that publishes no size at all sorts equal.
+function tableStatsSql(whereClause: string): string {
+  return `
         SELECT
           schemaname as schema_name,
           relname as table_name,
           n_live_tup as live_row_count,
           n_dead_tup as dead_row_count,
           n_live_tup + n_dead_tup as row_count,
-          pg_size_pretty(pg_table_size(quote_ident(schemaname) || '.' || quote_ident(relname))) as table_size,
-          pg_table_size(quote_ident(schemaname) || '.' || quote_ident(relname)) as table_size_bytes,
-          pg_size_pretty(pg_indexes_size(quote_ident(schemaname) || '.' || quote_ident(relname))) as index_size,
-          pg_indexes_size(quote_ident(schemaname) || '.' || quote_ident(relname)) as index_size_bytes,
-          pg_size_pretty(pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(relname))) as total_size,
-          pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(relname)) as total_size_bytes,
+          pg_table_size(relid) as table_size_bytes,
+          pg_indexes_size(relid) as index_size_bytes,
+          pg_total_relation_size(relid) as total_size_bytes,
           last_vacuum,
           last_autovacuum,
           last_analyze,
@@ -2090,11 +2138,63 @@ const TABLE_STATS_SELECT_SQL = `
             ELSE 0
           END as bloat_ratio
         FROM pg_stat_user_tables
-        `;
-
-const TABLE_STATS_ORDER_SQL = `
-        ORDER BY pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(relname)) DESC
+        ${whereClause}
+        ORDER BY total_size_bytes DESC NULLS LAST, schema_name, table_name
       `;
+}
+
+// One refused size builtin, replaced by a typed NULL so the column keeps its place and the
+// row survives. `NULL::bigint` rather than a bare NULL because the value is read as a byte
+// count and the ORDER BY sorts on it; measured to bind on PostgreSQL 18.6, CockroachDB
+// v26.3.2 and RisingWave 3.1.0 alike.
+//
+// NOT a 0: a 0 is a measurement, and nobody measured this one. The Storage tab's
+// `tableSizeKnown` gate and the Tables tab both read the absence and draw "N/A", which is
+// the rule BACKLOG D105 states and the reason `tableSizeBytes` is optional at all.
+function withoutSizeFn(fn: string): (sql: string) => string {
+  return (sql) => sql.replaceAll(`${fn}(relid)`, "NULL::bigint");
+}
+
+function isMissingSizeFnError(fn: string): (error: unknown) => boolean {
+  return (error) => error instanceof Error && error.message.toLowerCase().includes(fn);
+}
+
+/**
+ * One size column as the bytes it measured, or `undefined` where the engine published none.
+ *
+ * `pg` hands a bigint back as a string, so the conversion is not optional. A NULL is an
+ * absence, and so is anything that is not a finite number: the value is drawn as a size and
+ * summed into the Storage tab's shares, and a NaN there would spread through both.
+ */
+function sizeBytesOf(raw: unknown): number | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const bytes = Number(raw);
+  return Number.isFinite(bytes) ? bytes : undefined;
+}
+
+/**
+ * The total a row can stand behind: the engine's own figure, or the two parts PostgreSQL
+ * defines it as when only the total was refused.
+ *
+ * `pg_total_relation_size` is documented as `pg_table_size` plus `pg_indexes_size`, so adding
+ * them is the engine's own arithmetic rather than this provider's guess. RisingWave 3.1.0
+ * refuses that one builtin alone, which left a row carrying a measured 44-byte table size
+ * beside a total of 0. Both the Tables tab's Size card and the Storage tab's share gate on
+ * `tableSizeBytes` by itself, because until now a measured table size always arrived with a
+ * measured total, so that 0 was summed and drawn as "0 B" over a table with bytes in it -
+ * the fabricated zero BACKLOG D105 is about, and the one this read exists to stop writing.
+ *
+ * `undefined` where either part is missing too: there is nothing to add up, and the caller
+ * drops the parts with it so those gates read the absence instead of summing the placeholder.
+ */
+function totalSizeBytesOf(
+  measured: number | undefined,
+  tableBytes: number | undefined,
+  indexBytes: number | undefined,
+): number | undefined {
+  if (measured !== undefined) return measured;
+  return tableBytes !== undefined && indexBytes !== undefined ? tableBytes + indexBytes : undefined;
+}
 
 // getIndexStats: per-index stats. A schema WHERE clause is interpolated
 // between the two fragments at the call site. `attname` is cast to `text` because
@@ -2293,6 +2393,36 @@ async function probeExplainFormat(client: PoolClient): Promise<ExplainFormat | u
 }
 
 /**
+ * The smallest statement that needs what the guard around a routine edit needs (#1437).
+ *
+ * `buildObjectEdit` wraps the reader's `CREATE` in two `DO` blocks, and both read `pg_proc.xmin`
+ * while the first stores it with `PERFORM set_config(...)`. An empty block is not enough to ask
+ * about: measured on CockroachDB v26.3.2 on 2026-10-08, `DO $$ BEGIN END $$` runs, while a block
+ * holding `PERFORM` answers `at or near ";": syntax error: unimplemented: this syntax` and
+ * `SELECT p.xmin FROM pg_catalog.pg_proc p` answers `column "p.xmin" does not exist`. So every
+ * apply there was refused after the reader had typed it. This block asks for `PERFORM` and for
+ * `xmin` and reads no row; on PostgreSQL 18 it answers `DO`.
+ */
+const ROUTINE_GUARD_PROBE_SQL = "DO $probe$BEGIN PERFORM p.xmin FROM pg_catalog.pg_proc p WHERE false; END$probe$";
+
+/**
+ * Whether this server runs the guard a routine edit is applied under. Run once per `connect()`,
+ * on the client connect already borrowed, beside `probeExplainFormat` and for its reasons: it
+ * reads SUCCESS OR FAILURE and never the message, and nothing here rejects. A server that cannot
+ * run the guard is a fact about the Source tab's Edit control, not about the connection.
+ */
+async function probeRoutineGuard(client: PoolClient): Promise<boolean> {
+  try {
+    await client.query(ROUTINE_GUARD_PROBE_SQL);
+    return true;
+  } catch {
+    // Refused, so no routine is offered for editing. The refusal is the engine's own and the
+    // capability this produces IS the report.
+    return false;
+  }
+}
+
+/**
  * PostgreSQL's maintenance, as PostgreSQL itself runs it.
  *
  * Every statement has both forms - `VACUUM ANALYZE <table>` and bare `VACUUM ANALYZE`, `REINDEX
@@ -2444,6 +2574,14 @@ export class PostgresProvider extends SQLBaseProvider {
   private measuredExplainFormat: ExplainFormat | undefined = "postgres-json";
 
   /**
+   * Whether this server runs the guard a routine edit is applied under, measured by
+   * `probeRoutineGuard()` at connect (#1437). It starts true, which is what the routine kinds
+   * declared before the probe existed, for the reason `measuredExplainFormat` starts at
+   * PostgreSQL's grammar.
+   */
+  private measuredRoutineGuard = true;
+
+  /**
    * Which placements of each maintenance statement this server accepts, measured by
    * `probeMaintenance()` at connect (#1387). Undefined is "not measured", and answers the whole
    * PostgreSQL set for the same reason `measuredExplainFormat` starts at PostgreSQL's grammar.
@@ -2569,7 +2707,10 @@ export class PostgresProvider extends SQLBaseProvider {
           labelPlural: "Functions",
           hasSource: true,
           sourceLanguage: "pgsql",
-          acceptsSourceEdits: true,
+          // Measured at connect, not declared per type id (#1437): an engine on this type id that
+          // cannot run the apply's guard is never offered the edit. Absent rather than false, so
+          // `kindAcceptsSourceEdits` and the Source read's affordance answer from one fact.
+          ...(this.measuredRoutineGuard ? { acceptsSourceEdits: true } : {}),
         },
         {
           id: "procedure",
@@ -2578,7 +2719,7 @@ export class PostgresProvider extends SQLBaseProvider {
           labelPlural: "Procedures",
           hasSource: true,
           sourceLanguage: "pgsql",
-          acceptsSourceEdits: true,
+          ...(this.measuredRoutineGuard ? { acceptsSourceEdits: true } : {}),
         },
         {
           id: "trigger",
@@ -2665,9 +2806,11 @@ export class PostgresProvider extends SQLBaseProvider {
         // answered `postgres-json` anyway. So the profile keeps the static default and
         // the envelope keeps its hole-free guarantee.
         // The maintenance probe is skipped under the profile for the same envelope reason, and
-        // the agent runs no maintenance.
+        // the agent runs no maintenance. So is the routine-guard probe, and the agent edits no
+        // routine.
         if (!this.readOnlyProfile) {
           this.measuredExplainFormat = await probeExplainFormat(client);
+          this.measuredRoutineGuard = await probeRoutineGuard(client);
           const probe = await this.probeMaintenance(client);
           this.measuredMaintenance = probe.measured;
           connectClientFault = probe.discard;
@@ -3395,6 +3538,21 @@ export class PostgresProvider extends SQLBaseProvider {
   }
 
   /**
+   * One count read, retried once without the extension ownership test on an engine that has
+   * no `pg_depend` or `pg_extension` (#1429). Any other refusal leaves raw rather than
+   * mapped, because `countObjects` files the server's own sentence and keys its routine
+   * retry on it.
+   */
+  private async queryCounts(client: PoolClient, sql: string, schema: string) {
+    try {
+      return await client.query(sql, [schema]);
+    } catch (error) {
+      if (!isMissingExtensionCatalogError(error)) throw error;
+      return client.query(withoutExtensionOwnershipTest(sql), [schema]);
+    }
+  }
+
+  /**
    * How many objects of each declared kind one schema holds.
    *
    * Three outcomes, and the type keeps all three apart. A kind the GROUP BY answered for
@@ -3423,7 +3581,7 @@ export class PostgresProvider extends SQLBaseProvider {
     const client = await this.pool!.connect();
     try {
       try {
-        applyKindCounts(counts, (await client.query(COUNTS_SQL, [schema])).rows);
+        applyKindCounts(counts, (await this.queryCounts(client, COUNTS_SQL, schema)).rows);
       } catch (error) {
         if (!isMissingProkindError(error)) {
           return unavailableCounts(
@@ -3434,7 +3592,7 @@ export class PostgresProvider extends SQLBaseProvider {
         const routines = declared.filter((kind) => kind.role === "routine");
         const rest = declared.filter((kind) => kind.role !== "routine");
         try {
-          applyKindCounts(counts, (await client.query(COUNTS_SQL_WITHOUT_ROUTINES, [schema])).rows);
+          applyKindCounts(counts, (await this.queryCounts(client, COUNTS_SQL_WITHOUT_ROUTINES, schema)).rows);
         } catch (retryError) {
           Object.assign(
             counts,
@@ -3465,7 +3623,8 @@ export class PostgresProvider extends SQLBaseProvider {
    * CockroachDB and Materialize do not have, and `pg_class.reltuples` is a column
    * RisingWave does not have. They are independent, an engine can refuse both, and each
    * repair is applied to whatever statement is current rather than to the original, so
-   * the order the refusals arrive in does not matter.
+   * the order the refusals arrive in does not matter. The extension ownership test is the
+   * third repair, for an engine without `pg_depend` or `pg_extension` (#1429).
    *
    * Every failure leaves by the same door quoting the statement the server actually
    * received, which after a repair is the rewritten one: quoting the original would
@@ -3475,6 +3634,7 @@ export class PostgresProvider extends SQLBaseProvider {
     const remainingFallbacks = [
       { matches: isMissingTotalRelationSizeError, apply: withoutSizeColumn },
       { matches: isMissingRowCountColumnError, apply: withoutRowCountColumn },
+      { matches: isMissingExtensionCatalogError, apply: withoutExtensionOwnershipTest },
     ];
     let currentSql = statement.sql;
     for (;;) {
@@ -5170,6 +5330,40 @@ export class PostgresProvider extends SQLBaseProvider {
   }
 
   /**
+   * The table statistics, retried without whichever size builtin the engine refuses (#1436).
+   *
+   * One repair per builtin, each applied to whatever statement is current, so an engine that
+   * refuses two of the three still answers: RisingWave 3.1.0 publishes pg_table_size and
+   * pg_indexes_size and not pg_total_relation_size, and nothing here assumes the three stand
+   * or fall together.
+   *
+   * A refusal that is NOT one of them is rethrown, which is the distinction `MonitoringData`
+   * draws: an absent panel carries the engine's sentence and means "could not answer", while
+   * rows with an absent size mean "answered, and published no size". A missing
+   * `pg_stat_user_tables` or a planner restriction leaves nothing to answer with and still
+   * reaches the panel as itself.
+   */
+  private async queryTableStats(client: PoolClient, whereClause: string, params: unknown[]) {
+    const remainingFallbacks = TABLE_SIZE_FNS.map((fn) => ({
+      matches: isMissingSizeFnError(fn),
+      apply: withoutSizeFn(fn),
+    }));
+    let currentSql = tableStatsSql(whereClause);
+    for (;;) {
+      try {
+        return await client.query(currentSql, params);
+      } catch (error) {
+        const index = remainingFallbacks.findIndex((fallback) => fallback.matches(error));
+        // currentSql, not the original: after a repair the server received the rewritten
+        // statement, and quoting the first one would point a reader at text it never saw.
+        if (index === -1) throw mapDatabaseError(error, "postgres", currentSql);
+        currentSql = remainingFallbacks[index].apply(currentSql);
+        remainingFallbacks.splice(index, 1);
+      }
+    }
+  }
+
+  /**
    * Get table statistics
    */
   public async getTableStats(options?: { schema?: string }): Promise<TableStats[]> {
@@ -5182,24 +5376,49 @@ export class PostgresProvider extends SQLBaseProvider {
       const whereClause = schema ? `WHERE schemaname = $1` : `WHERE ${schemaExclusion("schemaname")}`;
       const params = schema ? [schema] : [];
 
-      const res = await client.query(`${TABLE_STATS_SELECT_SQL}${whereClause}${TABLE_STATS_ORDER_SQL}`, params);
+      const res = await this.queryTableStats(client, whereClause, params);
 
-      return res.rows.map((r) => ({
-        schemaName: r.schema_name,
-        tableName: r.table_name,
-        rowCount: parseInt(r.row_count || "0"),
-        liveRowCount: parseInt(r.live_row_count || "0"),
-        deadRowCount: parseInt(r.dead_row_count || "0"),
-        tableSize: r.table_size || "0 bytes",
-        tableSizeBytes: parseInt(r.table_size_bytes || "0"),
-        indexSize: r.index_size || "0 bytes",
-        indexSizeBytes: parseInt(r.index_size_bytes || "0"),
-        totalSize: r.total_size || "0 bytes",
-        totalSizeBytes: parseInt(r.total_size_bytes || "0"),
-        lastVacuum: r.last_vacuum || r.last_autovacuum ? new Date(r.last_vacuum || r.last_autovacuum) : undefined,
-        lastAnalyze: r.last_analyze || r.last_autoanalyze ? new Date(r.last_analyze || r.last_autoanalyze) : undefined,
-        bloatRatio: parseFloat(r.bloat_ratio || "0"),
-      }));
+      return res.rows.map((r) => {
+        // Each size is kept only where the engine published it. A refused builtin arrives as
+        // the typed NULL `withoutSizeFn()` left behind, and CockroachDB v26.3.2 answers
+        // `pg_table_size(<oid>)` with NULL for a table it has, so absence reaches here as a
+        // value and not only as a repair.
+        const tableBytes = sizeBytesOf(r.table_size_bytes);
+        const indexBytes = sizeBytesOf(r.index_size_bytes);
+        const totalBytes = totalSizeBytesOf(sizeBytesOf(r.total_size_bytes), tableBytes, indexBytes);
+        // A part is published only where the row can also stand behind a total. Those two
+        // panels read `tableSizeBytes` as "this engine publishes per-table bytes at all", and
+        // a part without a total leaves the required `totalSizeBytes` carrying the 0 they
+        // would then sum, so an underivable total takes the parts with it. No engine measured
+        // here refuses a part AND the total - RisingWave refuses the total alone, CockroachDB
+        // answers NULL for all three - so this is the shape being closed rather than one seen.
+        const sized = totalBytes !== undefined;
+        return {
+          schemaName: r.schema_name,
+          tableName: r.table_name,
+          rowCount: parseInt(r.row_count || "0"),
+          liveRowCount: parseInt(r.live_row_count || "0"),
+          deadRowCount: parseInt(r.dead_row_count || "0"),
+          ...(sized && tableBytes !== undefined
+            ? { tableSize: formatBytes(tableBytes), tableSizeBytes: tableBytes }
+            : {}),
+          ...(sized && indexBytes !== undefined
+            ? { indexSize: formatBytes(indexBytes), indexSizeBytes: indexBytes }
+            : {}),
+          // `totalSize` and `totalSizeBytes` are the two the type still demands, so an
+          // unmeasured total is spelled the way the other providers spell it, "N/A" beside a 0
+          // (`sqlite.ts`, `libsql/introspect.ts`). That residual 0 is D105's to remove, for
+          // every provider at once, and not this read's to invent a shape for. It is only ever
+          // read beside an absent `tableSizeBytes` now, which is what makes those panels
+          // show "N/A" rather than add it up.
+          totalSize: totalBytes === undefined ? "N/A" : formatBytes(totalBytes),
+          totalSizeBytes: totalBytes ?? 0,
+          lastVacuum: r.last_vacuum || r.last_autovacuum ? new Date(r.last_vacuum || r.last_autovacuum) : undefined,
+          lastAnalyze:
+            r.last_analyze || r.last_autoanalyze ? new Date(r.last_analyze || r.last_autoanalyze) : undefined,
+          bloatRatio: parseFloat(r.bloat_ratio || "0"),
+        };
+      });
     } finally {
       client.release();
     }

@@ -249,6 +249,37 @@ a rejected read leaves its panel absent and records the engine's own sentence un
 `errors`, while an empty array claims the engine answered "nothing" — a measurement it
 never made, and one that throws away the sentence saying why.
 
+A refused **size builtin** is not one of those cases, and since #1436 does not reject.
+`pg_table_size()`, `pg_indexes_size()` and `pg_total_relation_size()` are three columns of a
+read whose other columns the engine answers, so each is dropped on its own
+(`queryTableStats()`) and the rows arrive with that size absent — never as a `0`, which
+would be a measurement nobody made ([D105](../BACKLOG.md)). Measured on RisingWave 3.1.0,
+which binds neither `pg_size_pretty()` nor `pg_total_relation_size()` but answers
+`pg_table_size(relid)` and `pg_indexes_size(relid)`: the panel now lists the tables with
+their sizes, where the whole read used to fail.
+
+**The total is the one size that can be derived rather than dropped**, and
+`totalSizeBytes()` does. PostgreSQL defines `pg_total_relation_size()` as `pg_table_size()`
+plus `pg_indexes_size()`, so adding the two measured parts is the engine's own arithmetic and
+not this provider's guess. It has to be derived rather than left absent because
+`totalSizeBytes` is a **required** field: an absent total still has to carry a number, and the
+`N/A`-beside-`0` spelling the other providers use is only safe where nothing else on the row
+claims a size. The Tables tab's Size card and the Storage tab's share both gate on
+`tableSizeBytes` alone — until #1436 a measured table size always arrived with a measured
+total — so a row carrying one part and the placeholder got that `0` summed and drawn as a
+reading. Measured on RisingWave 3.1.0 on 2026-10-08, one table of two rows:
+`pg_table_size` 89, `pg_indexes_size` 0, `pg_total_relation_size` *function
+pg_total_relation_size(integer) does not exist*. The card read **0 B** over a table with
+bytes in it; it now reads **89 B**. Where a part is refused as well there is nothing to add
+up, and the row publishes no sizes at all, so those gates read the absence and answer `N/A`
+instead of summing the placeholder. No engine measured here does that — RisingWave refuses
+the total alone, CockroachDB answers NULL for all three — so that arm closes the shape rather
+than one seen.
+
+Materialize's outcome is unchanged, because its refusal is not the size call alone: it has
+no `pg_stat_user_tables` either, so the statement still has nothing to read FROM and the
+panel still carries that sentence.
+
 The distinction a reader needs is then drawn where the sentence is rendered.
 `describesAbsentObject()` ([monitoring-absence.ts](../../src/lib/monitoring-absence.ts))
 asks whether the message names a `pg_`-prefixed object that is not there, and
@@ -308,6 +339,31 @@ schema is never extension-owned so it always survives. Measured accepted on all 
 engines, PostgreSQL included, where it correctly returns nothing; the driver serves
 engines nobody here has run, so an engine without `pg_depend` or `pg_extension` drops the
 clause through `withoutExtensionOwnershipTest()` and keeps the fixed list.
+
+The object browser asks the same question one level down, per object (#1429). An extension
+can put its routines and relations into a user's own schema, where no schema filter reaches
+them: `CREATE EXTENSION pgcrypto` and `hstore` add 97 functions to `public`, and
+`pg_stat_statements` adds three functions and two views. `extensionMemberExclusion()` drops every routine
+(`pg_proc`) and relation (`pg_class`) with a `pg_depend` row of `deptype = 'e'` from the
+folder counts, the listings and `describeObjects()`, which is the same relation test the
+agent's catalog read carries, so the two agree. A user's own object never has such a row.
+Measured 2026-10-08 with user objects seeded next to the extensions:
+
+| Engine | Catalog in `public` | Object browser |
+|---|---|---|
+| PostgreSQL 18.6, pgcrypto + hstore + pg_stat_statements | 102 functions, 3 views | 2 functions, 1 view |
+| TimescaleDB on PG 18.6 | 90 functions, 13 procedures | 2 functions, 0 procedures |
+| OrioleDB beta 19 on PG 18.6 | 80 functions, 5 views | 2 functions, 1 view |
+| Percona PostgreSQL 18.6.1, pg_stat_monitor | 15 functions, 2 views | 2 functions, 1 view |
+| AlloyDB Omni 17.9, as the image ships | 150 functions, 50 views | 2 functions, 1 view |
+| YugabyteDB 2026.1.2 (PG 15.12), pgcrypto + hstore | 98 functions | 1 function |
+| CockroachDB 26.3.2 | 1 function, 1 view, 1 table | the same; `pg_depend` answers nothing |
+| Materialize 26.45.1 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+| RisingWave 3.1.0 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+
+All nine accept the clause. The listings and counts retry without it on an engine that
+refuses `pg_depend` or `pg_extension`, through `queryListing()` and `queryCounts()`, and
+`describeObjects()` already runs through the fallback chain that drops it.
 
 The fixed list stays for schemas the *engine itself* builds in, which are not
 extension-owned: measured, CockroachDB's `crdb_internal` and Cloudberry's `pg_ext_aux`
@@ -741,7 +797,10 @@ A PL/pgSQL body inside a `$function$` dollar-quoted string is highlighted as Pos
 
 ### 3.1.6 Object edit (#789)
 
-Two kinds accept an edited definition back, `function` and `procedure`, and both declare `acceptsSourceEdits: true`.
+Two kinds accept an edited definition back, `function` and `procedure`, and both declare `acceptsSourceEdits: true` on a server that runs the apply's guard.
+That is measured at connect (#1437), because the guard's two `DO` blocks need `PERFORM` and `pg_proc.xmin` and not every server on this type id has them: `probeRoutineGuard` sends `DO $probe$BEGIN PERFORM p.xmin FROM pg_catalog.pg_proc p WHERE false; END$probe$`, reads success or failure only, and is skipped under the read-only profile like the EXPLAIN probe.
+Measured 2026-10-08: PostgreSQL 18.6 answers `DO`; CockroachDB v26.3.2 runs an empty `DO $$ BEGIN END $$` but answers `0A000 at or near ";": syntax error: unimplemented: this syntax` for the probe and `42703 column "p.xmin" does not exist` for the column, so there neither kind declares the field, the Source read carries no `edit`, and a build is refused before anything is sent.
+Before this, CockroachDB was offered Edit and every apply answered that same `0A000` refusal.
 Everything below was measured on PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1) through `pg`, against a container brought up on `docker/postgres-init/`.
 
 **The three kinds that are REFUSED, each with the engine fact behind it, and one that is deferred.**
@@ -990,6 +1049,7 @@ Closing that means either a seventh outcome arm or a narrowed sentence in `src/l
 **The limit every claim on this page carries (D62).**
 Every PostgreSQL row above is a claim about 18.4.
 This type id also serves CockroachDB and Materialize, and neither was probed for any of it.
+The one exception is whether the guard runs at all, which every server is now asked at connect (#1437, at the top of this section); CockroachDB v26.3.2 answers no, so none of these rows is reached there.
 That is why the classifier answers `definition` with THE ENGINE'S OWN SENTENCE for a code it does not recognise, rather than guessing at a class, and why a server answering no md5 gets an `unsupported` refusal rather than an unguarded write.
 
 **Reproducing all of it.**
@@ -1708,7 +1768,7 @@ base) fans these out in parallel.
 | `getPerformanceMetrics()` | `pg_statio_user_tables`, `pg_stat_database`, `pg_stat_checkpointer` (17+) or `pg_stat_bgwriter` | cache-hit % (omitted when unmeasurable), deadlocks, checkpoint write time (`N/A` when unreadable); **no buffer-pool %** — see [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `pg_stat_statements` → fallback `pg_stat_activity` | detailed per-statement stats; fallback shows live active queries |
 | `getActiveSessions()` | `pg_stat_activity` | pid, user, state, query, wait events, duration; excludes own backend |
-| `getTableStats()` | `pg_stat_user_tables` + size functions | live/dead tuples, sizes, last (auto)vacuum/analyze, bloat ratio |
+| `getTableStats()` | `pg_stat_user_tables` + `pg_table_size`/`pg_indexes_size`/`pg_total_relation_size`, each on `relid` | live/dead tuples, sizes (absent per function the engine refuses, [§3.1.2](#312-two-kinds-of-absence-and-why-neither-is-an-empty-array)), last (auto)vacuum/analyze, bloat ratio |
 | `getIndexStats()` | `pg_stat_user_indexes`, `pg_index`, `pg_am` | type, columns, unique/primary, size, scan count, usage ratio |
 | `getStorageStats()` | `pg_tablespace`, WAL functions | per-tablespace size; WAL size (superuser-gated, swallowed if denied) |
 | `getPgStatActivity()` | `pg_stat_activity` | raw passthrough for advanced views |
@@ -1735,6 +1795,14 @@ zero and is still published as `0`/`"0 B"`, which is the shared helper's contrac
 state this engine produces: `pg_database_size()` is a function, not an aggregate, and measured on
 PostgreSQL 18 a freshly created database answers 7774735 bytes, never `NULL` and never zero. MySQL's
 `SUM()` over an empty schema is where that null row is real.
+
+**The table sizes are read the same way (#1436).** `getTableStats()` selects the three byte figures
+only and spells each with `formatBytes()`, so it selects no `pg_size_pretty()` column either — the
+shape `getOverview()` above and the object surface already use. That makes one spelling of a byte
+count across the provider instead of two, and it is visible: a 16384-byte table reads `16 KB` where
+`pg_size_pretty()` wrote `16 kB`. The bytes are unchanged, and it removes a builtin RisingWave does
+not bind. Each size is absent, never `0`, where its builtin is refused or answers `NULL` — which is
+what CockroachDB v26.3.2 does for a table it has.
 
 ### 7.1 When the cache hit ratio is not measurable
 
